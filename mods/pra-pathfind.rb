@@ -573,6 +573,55 @@ def is_teleport_event?(event)
   return false
 end
 
+# Returns a direct, unconditional Player Touch transfer that is safe to use as
+# a pathfinding edge. Variable destinations and transfers inside conditional
+# branches are intentionally excluded because their destination cannot be
+# proven from the current map state.
+def pathfinding_transfer_command(event)
+  return nil if !event || !event.list || event.trigger != 1
+
+  for command in event.list
+    next if command.code != 201
+    next if command.respond_to?(:indent) && command.indent != 0
+
+    parameters = command.parameters
+    next if !parameters || parameters.length < 4
+    next if parameters[0] != 0
+    return command
+  end
+  return nil
+end
+
+# Gets the destination of an active, static warp within the current map. Only
+# same-map warps are graph edges; external transfers remain route endpoints.
+def interior_warp_destination_at(x, y, map = $game_map)
+  return nil if !map || !map.events
+
+  for event in map.events.values
+    next if event.x != x || event.y != y
+    command = pathfinding_transfer_command(event)
+    next if !command
+
+    parameters = command.parameters
+    next if parameters[1] != map.map_id
+    destination_x = parameters[2]
+    destination_y = parameters[3]
+    next if !map.valid?(destination_x, destination_y)
+    next if destination_x == x && destination_y == y
+    return [destination_x, destination_y]
+  end
+  return nil
+end
+
+def has_pathfinding_interior_warps?(map = $game_map)
+  return false if !map || !map.events
+  for event in map.events.values
+    command = pathfinding_transfer_command(event)
+    return true if command && command.parameters[1] == map.map_id
+  end
+  return false
+end
+
 def get_map_name(map_id)
     return "" if map_id.nil?
     # Retrieve the map object from the factory using the ID
@@ -1166,6 +1215,12 @@ def reduceEventsInLanes(events_list)
       if lastNode == nil
         #Kernel.pbMessage("lastNode ist nil" + route.to_s)
       end
+      if node.respond_to?(:warp_transition) && node.warp_transition
+        instructions.push(Instruction.new("warp"))
+        currentDirection = "none"
+        lastNode = node
+        next
+      end
       direction = findRelativeDirection(lastNode, node)
       if (currentDirection == direction)
         instructions[-1].steps = instructions[-1].steps + 1
@@ -1220,7 +1275,11 @@ def reduceEventsInLanes(events_list)
     for instruction in instructions
       #     file.write(instruction.steps.to_s + ", " + instruction.direction.to_s + "\n")
       #s = s + instruction.steps.to_s + (instruction.steps == 1 ? " step " : " steps ") + instruction.direction.to_s + ", "
-      s = s + instruction.steps.to_s + " " + instruction.direction.to_s + ", "
+      if instruction.direction == "warp"
+        s = s + "take warp, "
+      else
+        s = s + instruction.steps.to_s + " " + instruction.direction.to_s + ", "
+      end
     end
     if s.length > 2
       s = s[0..-3]
@@ -1234,15 +1293,16 @@ def reduceEventsInLanes(events_list)
   end
 
   class Node
-    attr_accessor :x, :y, :gCost, :hCost, :parent
+    attr_accessor :x, :y, :gCost, :hCost, :parent, :warp_transition
     @parent
     @gCost
     @hCost
 
-    def initialize(paraX, paraY)
+    def initialize(paraX, paraY, warp_transition = false)
       @x = paraX
       @y = paraY
       @parent = "none"
+      @warp_transition = warp_transition
     end
 
     def equals (node)
@@ -1272,6 +1332,11 @@ def reduceEventsInLanes(events_list)
   def aStern(start, target, map = $game_map)
     iterations = 0;
     start.gCost = 0
+    use_warp_edges = has_pathfinding_interior_warps?(map)
+    iteration_limit = 5000
+    if use_warp_edges && map.respond_to?(:width) && map.respond_to?(:height)
+      iteration_limit = [iteration_limit, map.width * map.height * 2].max
+    end
 
     d = 0
     isTargetPassable = isTargetPassable(target, map)
@@ -1293,13 +1358,16 @@ def reduceEventsInLanes(events_list)
       end
     end
 
-    start.hCost = distanceNode(start, target)
+    # Euclidean distance is not admissible when a warp can cross the map in
+    # one edge. Dijkstra mode keeps the route valid and shortest by movement
+    # cost on maps that contain interior warps.
+    start.hCost = use_warp_edges ? 0 : distanceNode(start, target)
     openSet = []
     closedSet = []
     openSet.push(start)
     while openSet.length > 0 do
       iterations = iterations + 1
-      if iterations > 5000
+      if iterations > iteration_limit
         return []
       end
       s = ""
@@ -1334,7 +1402,11 @@ def reduceEventsInLanes(events_list)
         end
         neighbtheIndex = getNodeIndexInSet(neighbthe, openSet)
         newMovementCostToNeighbthe = 2
-        if currentNode.parent != "none"
+        if neighbthe.warp_transition
+          # Entering the source tile already paid for the player's step. The
+          # transfer itself does not require another movement input.
+          newMovementCostToNeighbthe = currentNode.gCost
+        elsif currentNode.parent != "none"
           xDifNeighbthe = neighbthe.x - currentNode.x
           yDifNeighbthe = neighbthe.y - currentNode.y
           xDifParent = currentNode.x - currentNode.parent.x
@@ -1350,12 +1422,13 @@ def reduceEventsInLanes(events_list)
 
         if neighbtheIndex > -1 && newMovementCostToNeighbthe < openSet[neighbtheIndex].gCost
           openSet[neighbtheIndex].gCost = newMovementCostToNeighbthe
-          openSet[neighbtheIndex].hCost = distanceNode(openSet[neighbtheIndex], target)
+          openSet[neighbtheIndex].hCost = use_warp_edges ? 0 : distanceNode(openSet[neighbtheIndex], target)
           openSet[neighbtheIndex].parent = currentNode
+          openSet[neighbtheIndex].warp_transition = neighbthe.warp_transition
         end
         if (neighbtheIndex == -1)
           neighbthe.gCost = newMovementCostToNeighbthe
-          neighbthe.hCost = distanceNode(neighbthe, target)
+          neighbthe.hCost = use_warp_edges ? 0 : distanceNode(neighbthe, target)
           neighbthe.parent = currentNode
           openSet.push(neighbthe)
         end
@@ -1579,6 +1652,17 @@ def reduceEventsInLanes(events_list)
   # Updated getNeighbthes using the new push logic
   def getNeighbthes(node, target, isTargetPassable, targetDirection, map)
     neighbthes = []
+
+    # A Player Touch transfer fires as soon as its source tile is entered, so
+    # it replaces normal cardinal movement from that tile. Following only the
+    # active, static, same-map destination prevents unrelated or conditional
+    # teleports from making genuinely disconnected areas appear reachable.
+    warp_destination = interior_warp_destination_at(node.x, node.y, map)
+    if warp_destination
+      neighbthes.push(Node.new(warp_destination[0], warp_destination[1], true))
+      return neighbthes
+    end
+
     # If the target is strictly passable, we don't need to pass the target node to push_neighbthe
     chooseTarget = (isTargetPassable || targetDirection != -1) ? nil : target
     

@@ -77,6 +77,18 @@ class Game_Player < Game_Character
   def follow_autowalk_path
     return if @current_autowalk_route.nil? || @current_autowalk_route.empty?
 
+    # A transfer may move the player before this update sees the source tile.
+    # If the player is already at a queued warp destination, discard the stale
+    # source segment and continue from the landing tile.
+    warp_index = @current_autowalk_route.index do |node|
+      node.respond_to?(:warp_transition) && node.warp_transition &&
+        node.x == @x && node.y == @y
+    end
+    if !warp_index.nil?
+      @current_autowalk_route.shift(warp_index + 1)
+      return if @current_autowalk_route.empty?
+    end
+
     # 1. Check if we have arrived at the current target node
     target = @current_autowalk_route.first
     
@@ -90,6 +102,13 @@ class Game_Player < Game_Character
       
       # Update target to the next node
       target = @current_autowalk_route.first
+    end
+
+    # The game event, not auto-walk, performs the non-adjacent transfer. Wait
+    # safely until the player arrives instead of walking toward remote map
+    # coordinates if the event interpreter needs another frame.
+    if target.respond_to?(:warp_transition) && target.warp_transition
+      return
     end
 
     # 2. Check if we are Adjacent + Blocked for the Final Step
